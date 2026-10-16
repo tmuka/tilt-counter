@@ -1,0 +1,13 @@
+Quantity,Manufacturer Part Number,Digi-Key Part Number,Manufacturer,Customer Reference
+12,ATTINY85-20PU,ATTINY85-20PU-ND,Microchip Technology,Microcontroller ATtiny85 DIP-8
+10,ED08DT,ED3044-5-ND,On Shore Technology,8-pin DIP socket
+20,173,1528-173-ND,Adafruit Industries,Ball tilt switch
+12,WP7113SURDK,,Kingbright,Red LED 5mm diffused
+12,151051BS04000,732-5015-ND,Wurth Elektronik,Blue LED 5mm diffused
+20,CF14JT1K00,,Stackpole Electronics,Resistor 1k 1/4W (red LED)
+20,CF14JT470R,,Stackpole Electronics,Resistor 470R 1/4W (blue LED)
+20,CF14JT10K0,CF14JT10K0CT-ND,Stackpole Electronics,Resistor 10k 1/4W (RESET pull-up)
+12,K104K15X7RF5TL2,,Vishay,Capacitor 0.1uF 50V ceramic (decoupling)
+12,1825910-6,450-1650-ND,TE Connectivity,Tactile button 6mm (reset)
+10,2487SW,,Keystone Electronics,"3xAA holder covered with switch, wire leads"
+1,PGM-11801,1568-11801-ND,SparkFun Electronics,Tiny AVR Programmer (buy one)
