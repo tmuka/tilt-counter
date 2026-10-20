@@ -37,11 +37,11 @@ The score plays **once**, after each counted tilt. Then the LEDs stay dark until
 Score blinks are always in sync, so the patterns that aren't a score **alternate** between red and blue instead:
 
 - **Power-on or a clear:** one bar of 8 alternating eighth notes (red, blue, red, blue…). Each is lit for the whole eighth, so the light passes straight from one LED to the other.
-- **While both counts are 0:** one short 20 ms blip per bar, alternating red and blue, until the first point. It stops when the board sleeps.
+- **While both counts are 0:** one short 20 ms blip per bar, alternating blue and red, until the first point. The first blip is blue, running straight on from the intro's last blue eighth. It stops when the board sleeps.
 
 ```
 power-on / clear:   | R B R B R B R B |
-0–0 idle:           | r . . . | b . . . | r . . . | ...
+0–0 idle:           | b . . . | r . . . | b . . . | ...
 ```
 
 ## The button

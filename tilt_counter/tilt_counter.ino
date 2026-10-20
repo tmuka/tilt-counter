@@ -181,7 +181,9 @@ void flashStep(uint32_t now, uint16_t litMs) {
 void startIdle(uint32_t now) {
   beatMs = SLOW_BEAT_MS;
   phase = PH_IDLE;
-  slot = 0;
+  // Start on blue: the intro ends on blue, so the first blip runs straight on
+  // from it instead of showing as an extra red blink
+  slot = 1;
   if (ZERO_BLIP_MS > 0) flashStep(now, ZERO_BLIP_MS);
   until = now + (uint32_t)beatMs * BEATS_PER_BAR;
 }
