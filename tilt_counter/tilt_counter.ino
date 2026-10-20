@@ -4,16 +4,31 @@
   Each SW-520D ball tilt switch adds 1 to its channel's count on every
   change of position: tilting counts 1 and returning counts 1 more.
 
-  One red LED and one blue LED blink in sync at 100 bpm. Blink number k
-  lights every LED whose count is at least k, so the side that's ahead keeps
-  blinking after the other stops. After a pause the cycle repeats. A new tilt
-  shows a 500 ms solid "acknowledge" on the side that moved, then both sides
-  restart together.
+  One red LED and one blue LED blink in sync, one blink per beat in 4/4.
+  Blink number k lights every LED whose count is at least k, so the side
+  that's ahead keeps blinking after the other stops. Beat 1 of each bar is a
+  longer (accented) blink, so the score can be counted in bars of 4. The score
+  plays once after each counted tilt, then the LEDs stay dark. The LEDs go
+  dark as soon as a switch starts to move, and the new score plays once the
+  tilt has counted.
+
+  Patterns that aren't a score alternate between the LEDs: power-on and a
+  clear play INTRO_BARS bars of alternating eighth notes, then while both
+  counts are 0 there's one short blip per bar, alternating LEDs.
+
+  The tempo rises with the score so the blinks take about TARGET_MS, between
+  MIN_BPM and MAX_BPM. After a button press the score always plays at MIN_BPM.
+
+  The button is wired to the chip's RESET pin. On the AVR boards the counts
+  survive that restart. One press plays the score PRESS_PLAYS times at
+  MIN_BPM, with PRESS_REST_BARS bars of rest between, then clears both
+  counts; a tilt during that playback cancels the clear. A second press
+  within PRESS_AGAIN_MS clears them at once.
+  Turning the power off also clears them. On the ESP32 the EN button always
+  clears them.
 
   After SLEEP_AFTER_MS with no tilts, the board goes into its lowest-power
   sleep. The next tilt wakes it, and that tilt is counted.
-  The reset button is wired to the chip's RESET/EN pin; a restart clears both
-  counts.
 
   Supported boards: ATtiny85 (ATTinyCore, 8 MHz internal), Arduino Pro Mini
   (ATmega328P), ESP32 (original ESP32). See README.md for wiring.
@@ -23,14 +38,23 @@
 
 // ============================== Settings ==============================
 
-const uint16_t DEBOUNCE_MS    = 50;     // switch must hold its new position this long
-const uint16_t TILT_ACK_MS    = 500;    // solid "acknowledge" shown right after a tilt
-const uint16_t ACK_GAP_MS     = 600;    // dark gap between the acknowledge and the count
-const uint16_t BLINK_ON_MS    = 300;    // 300 on + 300 off = 100 blinks per minute
-const uint16_t BLINK_OFF_MS   = 300;
-const uint16_t PAUSE_MS       = 1500;   // dark gap between repeats of the count
-const uint16_t ZERO_BLIP_MS   = 20;     // count 0: quick "alive" blip (0 = stay dark)
+const uint16_t DEBOUNCE_MS    = 400;    // switch must hold its new position this long; any rattle restarts the wait
+const uint16_t FLIP_LOCKOUT_MS = 1000;  // after a count, that switch can't count again for this long
+const uint16_t TILT_GAP_MS    = 600;    // dark time from a switch starting to move to the new score
+const uint16_t MIN_BPM        = 100;    // tempo for low scores, and after a button press
+const uint16_t MAX_BPM        = 200;    // fastest tempo, for high scores
+const uint16_t TARGET_MS      = 6000;   // aim for the blinks to take about this long
+const uint8_t  INTRO_BARS     = 1;      // power-on / clear: bars of alternating eighth notes
+const uint16_t ZERO_BLIP_MS   = 20;     // both counts 0: short blip once a bar, alternating LEDs (0 = stay dark)
+const uint8_t  PRESS_PLAYS    = 2;      // a single button press plays the score this many times,
+const uint8_t  PRESS_REST_BARS = 8;     // with this many bars of rest between, then clears
+const uint16_t PRESS_AGAIN_MS = 2000;   // a second button press within this clears the counts
+const uint16_t PRESS_BOUNCE_MS = 250;   // restarts sooner than this are button bounce, not a second press
 const uint32_t SLEEP_AFTER_MS = 10UL * 60UL * 1000UL;  // 10 minutes with no tilts
+
+const uint8_t  BEATS_PER_BAR  = 4;
+const uint16_t SLOW_BEAT_MS   = 60000UL / MIN_BPM;  // quarter note at MIN_BPM
+const uint16_t FAST_BEAT_MS   = 60000UL / MAX_BPM;  // quarter note at MAX_BPM
 
 // ============================== Pin maps ==============================
 
@@ -59,6 +83,27 @@ const uint32_t SLEEP_AFTER_MS = 10UL * 60UL * 1000UL;  // 10 minutes with no til
   #include <avr/sleep.h>
   #include <avr/power.h>
   #include <avr/interrupt.h>
+
+  // Kept through a RESET-button restart (.noinit RAM isn't zeroed at start-up).
+  // `check` tells real saved counts from the random RAM left by power-on.
+  struct Saved {
+    uint16_t count[2];
+    uint8_t  armed;      // 1 = a press right now clears the counts
+    uint16_t check;
+  };
+  Saved   saved __attribute__((section(".noinit")));
+  uint8_t bootFlags __attribute__((section(".noinit")));
+
+  // Runs before main(): keep why the chip restarted, then clear the flags.
+  void readResetFlags() __attribute__((naked, used, section(".init3")));
+  void readResetFlags() {
+    bootFlags = MCUSR;
+    MCUSR = 0;
+  }
+
+  uint16_t savedCheck() {
+    return 0x5A3C ^ saved.count[0] ^ (saved.count[1] << 1) ^ saved.armed;
+  }
 #endif
 #if IS_ESP32
   #include <esp_system.h>
@@ -72,11 +117,15 @@ struct Channel {
   bool     stable;       // debounced switch level
   bool     lastRaw;      // last raw reading
   uint32_t rawSince;     // when lastRaw last changed
+  uint32_t lockUntil;    // no new count before this time
   uint16_t count;
 };
 
 Channel  ch[2];
 uint32_t lastActivity;
+uint32_t armFrom;        // start of the press-again window (AVR)
+uint32_t armedUntil;     // end of the press-again window
+bool     armSoon;        // open the window at armFrom
 
 #if IS_ESP32
 // Kept through deep sleep
@@ -87,17 +136,30 @@ RTC_DATA_ATTR bool     rtcStable[2];
 static inline bool reached(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
 // ============================== Blink display ==============================
-// Both LEDs share one timeline. Blink number `slot` lights each LED whose
-// count is >= slot, so the side that's ahead keeps blinking after the other stops.
+// Both LEDs share one timeline on a beat grid. Blink number `slot` lights each
+// LED whose count is >= slot, so the side that's ahead keeps blinking after the
+// other stops. Score blinks are always in sync, so the patterns that aren't a
+// score alternate between the LEDs instead:
+//   PH_INTRO  power-on or a clear: alternating eighth notes for INTRO_BARS bars
+//   PH_IDLE   while both counts are 0: one short blip per bar, alternating LEDs
+// Each phase ends at a time computed from the previous one, not from millis(),
+// so the tempo doesn't drift. After a score the display rests in PH_DONE until
+// the next tilt or press.
 
-enum : uint8_t { PH_ACK, PH_GAP, PH_ON, PH_OFF, PH_PAUSE };
+enum : uint8_t { PH_HOLD, PH_ON, PH_OFF, PH_REST, PH_INTRO, PH_IDLE, PH_DONE };  // PH_REST: within a press's playback
 
-uint8_t  phase = PH_PAUSE;
-uint16_t slot;           // current blink, from 1
+uint8_t  phase = PH_DONE;
+uint16_t slot;           // current blink (from 1), or step of the intro / idle pattern
 uint16_t slots;          // blinks this cycle = the larger count
+bool     scoreDue;       // a tilt counted while the display was held dark
+uint8_t  plays;          // times the score has played since the button press
+bool     pressScore;     // started by a button press: play at MIN_BPM, then clear
+bool     switchMoving;   // a switch has left its counted position and hasn't settled
+uint32_t holdStart;      // when the display went dark for a tilt
+uint16_t beatMs;         // this cycle's quarter note
+uint32_t beatStart;      // when the current blink's beat began
 uint32_t until;          // when the current phase ends
-uint32_t blipUntil;      // when a zero count's "alive" blip ends
-uint8_t  ackMask;        // sides that tilted during the current acknowledge
+uint32_t litUntil;       // when an intro flash or idle blip ends
 
 void setLed(uint8_t i, bool on) { digitalWrite(PIN_LED[i], on ? HIGH : LOW); }
 
@@ -106,63 +168,149 @@ void ledsOff() {
   setLed(1, false);
 }
 
-void startBlink(uint32_t now) {
-  for (uint8_t i = 0; i < 2; i++) {
-    uint16_t n = ch[i].count;
-    setLed(i, n >= slot || (n == 0 && slot == 1 && ZERO_BLIP_MS > 0));
-  }
-  blipUntil = now + ZERO_BLIP_MS;
-  phase = PH_ON;
-  until = now + BLINK_ON_MS;
+bool bothZero() { return ch[0].count == 0 && ch[1].count == 0; }
+
+// One step of an alternating pattern: light LED `slot & 1` for `litMs`
+void flashStep(uint32_t now, uint16_t litMs) {
+  setLed(0, !(slot & 1));
+  setLed(1, slot & 1);
+  litUntil = now + litMs;
 }
 
-void startCycle(uint32_t now) {
+// While both counts are 0: a short blip once a bar, alternating LEDs
+void startIdle(uint32_t now) {
+  beatMs = SLOW_BEAT_MS;
+  phase = PH_IDLE;
+  slot = 0;
+  if (ZERO_BLIP_MS > 0) flashStep(now, ZERO_BLIP_MS);
+  until = now + (uint32_t)beatMs * BEATS_PER_BAR;
+}
+
+// Power-on or a clear: alternating eighth notes, each lit for the whole eighth
+void startIntro(uint32_t now) {
+  beatMs = SLOW_BEAT_MS;
+  phase = PH_INTRO;
+  slot = 0;
+  flashStep(now, beatMs / 2);
+  until = now + beatMs / 2;
+}
+
+// Zero both counts and play the intro to confirm
+void clearCounts(uint32_t now) {
+  ch[0].count = ch[1].count = 0;
+#if IS_AVR
+  saved.count[0] = saved.count[1] = 0;
+  saved.check = savedCheck();
+#endif
+  pressScore = false;
+  startIntro(now);
+}
+
+void startBlink(uint32_t now) {
+  for (uint8_t i = 0; i < 2; i++) setLed(i, ch[i].count >= slot);
+  bool downbeat = (slot - 1) % BEATS_PER_BAR == 0;
+  beatStart = now;
+  phase = PH_ON;
+  // Lit for an eighth; beat 1 of each bar for a dotted eighth
+  until = now + (downbeat ? beatMs * 3 / 4 : beatMs / 2);
+}
+
+void playScore(uint32_t now) {
   slots = ch[0].count > ch[1].count ? ch[0].count : ch[1].count;
-  if (slots == 0) slots = 1;   // one slot so a zero count can still blip
+  // Pick a tempo so the blinks take about TARGET_MS, within MIN_BPM..MAX_BPM
+  uint16_t b = TARGET_MS / slots;
+  if (pressScore || b > SLOW_BEAT_MS) b = SLOW_BEAT_MS;
+  if (b < FAST_BEAT_MS) b = FAST_BEAT_MS;
+  beatMs = b;
   slot = 1;
   startBlink(now);
 }
 
-void updateDisplay(uint32_t now) {
-  if (phase == PH_ON && reached(now, blipUntil)) {
-    for (uint8_t i = 0; i < 2; i++) if (ch[i].count == 0) setLed(i, false);
+// Play the score from the top: once after a tilt, or PRESS_PLAYS times
+// (slowly, then clear) after a button press. With no score yet, a press just
+// clears (playing the intro) and anything else goes to the idle blips.
+void startScore(uint32_t now, bool press = false) {
+  pressScore = press;
+  scoreDue = false;
+  plays = 0;
+  if (bothZero()) {
+    if (press) clearCounts(now);
+    else startIdle(now);
+    return;
   }
-  if (!reached(now, until)) return;
+  playScore(now);
+}
+
+void updateDisplay(uint32_t now) {
+  if ((phase == PH_INTRO || phase == PH_IDLE) && reached(now, litUntil)) ledsOff();
+  if (phase == PH_HOLD) {
+    // Dark while a switch moves. Once it has settled: play the new score if
+    // the move counted, pick up a button press's playback, go back to the
+    // idle blips at 0-0, or stay dark.
+    if (!switchMoving && now - holdStart >= TILT_GAP_MS) {
+      if (scoreDue || pressScore || bothZero()) startScore(now, pressScore);
+      else phase = PH_DONE;
+    }
+    return;
+  }
+  if (phase == PH_DONE || !reached(now, until)) return;
   switch (phase) {
-    case PH_ACK:
-      ledsOff();
-      phase = PH_GAP;
-      until = now + ACK_GAP_MS;
-      break;
     case PH_ON:
       ledsOff();
       if (slot < slots) {
         phase = PH_OFF;
-        until = now + BLINK_OFF_MS;
+        until = beatStart + beatMs;
+      } else if (pressScore && ++plays < PRESS_PLAYS) {
+        // Rest to the end of this bar, then PRESS_REST_BARS more; play again on the downbeat
+        uint16_t toBarEnd = (BEATS_PER_BAR - slots % BEATS_PER_BAR) % BEATS_PER_BAR;
+        phase = PH_REST;
+        until = beatStart + (uint32_t)beatMs * (1 + toBarEnd + PRESS_REST_BARS * BEATS_PER_BAR);
+      } else if (pressScore) {
+        phase = PH_REST;             // one dark beat, then the clear
+        until = beatStart + 2 * beatMs;
       } else {
-        phase = PH_PAUSE;
-        until = now + PAUSE_MS;
+        phase = PH_DONE;
       }
       break;
     case PH_OFF:
       slot++;
-      startBlink(now);
+      startBlink(until);
       break;
-    default:  // PH_GAP, PH_PAUSE
-      startCycle(now);
+    case PH_REST:
+      if (plays < PRESS_PLAYS) playScore(until);
+      else clearCounts(until);
+      break;
+    case PH_INTRO:
+      if (++slot < INTRO_BARS * BEATS_PER_BAR * 2) {
+        flashStep(until, beatMs / 2);
+        until += beatMs / 2;
+      } else {
+        startIdle(until);
+      }
+      break;
+    case PH_IDLE:
+      slot++;
+      if (ZERO_BLIP_MS > 0) flashStep(until, ZERO_BLIP_MS);
+      until += (uint32_t)beatMs * BEATS_PER_BAR;
       break;
   }
 }
 
-// Stop the cycle and light the side(s) that just moved. A tilt during the
-// acknowledge restarts it. Both sides then begin a fresh cycle together.
-void onCount(uint8_t i, uint32_t now) {
-  if (phase != PH_ACK) ackMask = 0;
-  ackMask |= 1 << i;
-  setLed(0, ackMask & 1);
-  setLed(1, ackMask & 2);
-  phase = PH_ACK;
-  until = now + TILT_ACK_MS;
+// Go dark as soon as a switch starts to move, so a blink of the old score
+// can't run into the new one. If the move turns out to be rattle that doesn't
+// count, the score just starts again from the top once the switch settles.
+void holdDisplay(uint32_t now) {
+  if (phase == PH_HOLD) return;
+  ledsOff();
+  phase = PH_HOLD;
+  holdStart = now;
+}
+
+// A tilt cancels a button press's pending clear: the game is still going.
+void onCount(uint32_t now) {
+  pressScore = false;
+  holdDisplay(now);   // usually already dark since the switch started moving
+  scoreDue = true;
 }
 
 // ============================== Switches ==============================
@@ -173,11 +321,18 @@ void pollSwitch(uint8_t i, uint32_t now) {
   if (raw != c.lastRaw) {
     c.lastRaw  = raw;
     c.rawSince = now;
-  } else if (raw != c.stable && now - c.rawSince >= DEBOUNCE_MS) {
+  } else if (raw != c.stable && now - c.rawSince >= DEBOUNCE_MS && reached(now, c.lockUntil)) {
     c.stable = raw;                  // tilt or untilt: both count
     if (c.count < 0xFFFF) c.count++;
+    // A see-saw bouncing back off its stop can hold the switch the wrong way
+    // for longer than DEBOUNCE_MS; ignore this switch until it has settled.
+    c.lockUntil = now + FLIP_LOCKOUT_MS;
+#if IS_AVR
+    saved.count[i] = c.count;
+    saved.check    = savedCheck();
+#endif
     lastActivity = now;
-    onCount(i, now);
+    onCount(now);
   }
 }
 
@@ -222,8 +377,7 @@ void goToSleep() {
   sei();
   uint32_t now = millis();
   lastActivity = now;
-  phase = PH_PAUSE;       // fresh cycle; the waking tilt is counted by pollSwitch()
-  until = now;
+  phase = PH_DONE;        // the waking tilt is counted by pollSwitch(), which starts the blinks
 }
 
 void idle() {
@@ -258,9 +412,21 @@ void idle() { delay(1); }
 // ============================== Main ==============================
 
 void setup() {
+  bool pressed = false;   // restarted by a single button press
 #if IS_AVR
   ADCSRA &= ~_BV(ADEN);
   power_adc_disable();
+
+  // A RESET-button restart keeps the counts; a second press inside the
+  // press-again window clears them. Power-on (or unreadable RAM) starts at 0.
+  // The window opens PRESS_BOUNCE_MS after the restart, so a bouncing button
+  // contact (several restarts within a few ms) isn't taken for a second press.
+  pressed = (bootFlags & _BV(EXTRF)) && !(bootFlags & _BV(PORF)) && saved.check == savedCheck();
+  bool cleared = pressed && saved.armed;
+  if (!pressed || cleared) saved.count[0] = saved.count[1] = 0;
+  saved.armed = 0;
+  saved.check = savedCheck();
+  armSoon = pressed && !cleared;
 #endif
 #if IS_ESP32
   setCpuFrequencyMhz(80);   // Wi-Fi and Bluetooth are never started
@@ -279,6 +445,9 @@ void setup() {
     Channel &c = ch[i];
     c.stable = digitalRead(PIN_SW[i]);
     c.count  = 0;
+#if IS_AVR
+    c.count  = saved.count[i];
+#endif
 #if IS_ESP32
     if (woke) {
       // Start from the saved position, so the tilt that woke the board is counted
@@ -287,18 +456,47 @@ void setup() {
     }
 #endif
     c.lastRaw  = c.stable;
-    c.rawSince = now;
+    c.rawSince  = now;
+    c.lockUntil = now;
   }
 
-  until = now;
   lastActivity = now;
+  armFrom      = now + PRESS_BOUNCE_MS;
+  armedUntil   = now + PRESS_AGAIN_MS;
+#if IS_AVR
+  if (cleared) {
+    clearCounts(now);
+    return;
+  }
+#endif
+#if IS_ESP32
+  if (woke) return;   // the waking tilt starts the blinks once it's counted
+#endif
+  if (pressed) startScore(now, true);   // play the score slowly, then clear
+  else startIntro(now);                 // power-on
 }
 
 void loop() {
   uint32_t now = millis();
   pollSwitch(0, now);
   pollSwitch(1, now);
+  // A switch is moving if it has left its counted position (outside its lockout)
+  switchMoving = false;
+  for (uint8_t i = 0; i < 2; i++)
+    if (ch[i].lastRaw != ch[i].stable && reached(now, ch[i].lockUntil)) switchMoving = true;
+  if (switchMoving) holdDisplay(now);
   updateDisplay(now);
+#if IS_AVR
+  if (armSoon && reached(now, armFrom)) {
+    armSoon = false;
+    saved.armed = 1;   // a press from now until armedUntil clears the counts
+    saved.check = savedCheck();
+  }
+  if (saved.armed && reached(now, armedUntil)) {
+    saved.armed = 0;   // too late for a second press: the next press only shows the score
+    saved.check = savedCheck();
+  }
+#endif
   if (now - lastActivity >= SLEEP_AFTER_MS) goToSleep();
   idle();
 }
