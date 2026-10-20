@@ -207,7 +207,7 @@ All settings are at the top of the sketch.
 
 ## Bench test
 
-1. **Power-on:** switch the battery pack on. You should see one bar of red and blue alternating, then a short blip once a bar, red and blue in turn.
+1. **Power-on:** switch the battery pack on. You should see one bar of red and blue alternating, then a short blip once a bar, starting on blue and then alternating.
 2. **First points:** tilt switch A and return it. Red should play 1 blink after the first tilt, then 2 blinks after the return, while blue stays dark.
 3. **Leader keeps going:** tilt switch B 5 times. Both LEDs should blink together for 2 beats, then blue carries on alone for 3 more. Beats 1 and 5 should be longer.
 4. **Interrupting:** tilt a switch in the middle of the score. The LEDs should go dark at once, then play the new score from the top.
